@@ -17,6 +17,7 @@ from sqlalchemy.engine import CursorResult
 from sqlalchemy.orm import Session
 from sqlalchemy.sql.dml import Insert
 
+from omnigent.db.account_authority import require_active_account
 from omnigent.db.db_models import SqlSessionPermission, SqlUser, current_workspace_id
 from omnigent.db.utils import (
     get_or_create_engine,
@@ -105,6 +106,7 @@ def _to_account(row: SqlUser) -> Account:
         created_at=row.created_at,
         last_login_at=row.last_login_at,
         has_password=row.password_hash is not None,
+        account_generation=row.account_generation,
     )
 
 
@@ -178,6 +180,7 @@ class SqlAlchemyPermissionStore(PermissionStore):
         """Upsert a permission grant. See base class for contract."""
 
         def write(session: Session) -> None:
+            require_active_account(session, user_id)
             dialect = self._engine.dialect.name
             values = {
                 "user_id": user_id,
@@ -279,6 +282,7 @@ class SqlAlchemyPermissionStore(PermissionStore):
         """
 
         def write(session: Session) -> tuple[int, bool]:
+            require_active_account(session, to_user_id)
             # FK target: ensure the destination users.id row exists. Don't
             # downgrade an existing admin flag; only create it if missing.
             if session.get(SqlUser, (current_workspace_id(), to_user_id)) is None:
@@ -418,6 +422,7 @@ class SqlAlchemyPermissionStore(PermissionStore):
         """Upsert a user row. See base class for contract."""
 
         def write(session: Session) -> None:
+            require_active_account(session, user_id)
             dialect = self._engine.dialect.name
             values = {"id": user_id, "is_admin": is_admin}
             stmt: Insert
@@ -444,6 +449,12 @@ class SqlAlchemyPermissionStore(PermissionStore):
 
         run_write_transaction(self._session_immediate, "ensure_user", write)
 
+    def user_exists(self, user_id: str) -> bool:
+        """Check for a user row. See base class for contract."""
+        with self._session("select_user_exists") as session:
+            row = session.get(SqlUser, (current_workspace_id(), user_id))
+            return row is not None and row.deleted_at is None
+
     def list_users(self, *, limit: int = 1000) -> list[Account]:
         """List every real user row. See base class for contract."""
         with self._session("list_users") as session:
@@ -456,18 +467,23 @@ class SqlAlchemyPermissionStore(PermissionStore):
                 .scalars()
                 .all()
             )
-            return [_to_account(r) for r in rows if r.id not in _HIDDEN_LIST_USERS]
+            return [
+                _to_account(r)
+                for r in rows
+                if r.id not in _HIDDEN_LIST_USERS and r.deleted_at is None
+            ]
 
     def is_admin(self, user_id: str) -> bool:
         """Check the admin flag. See base class for contract."""
         with self._session("select_user_admin_status") as session:
             row = session.get(SqlUser, (current_workspace_id(), user_id))
-            return row is not None and row.is_admin
+            return row is not None and row.deleted_at is None and row.is_admin
 
     def set_admin(self, user_id: str, is_admin: bool) -> None:
         """Set the admin flag on an existing user. See base class for contract."""
 
         def write(session: Session) -> None:
+            require_active_account(session, user_id)
             session.execute(
                 update(SqlUser)
                 .where(
@@ -619,7 +635,9 @@ class SqlAlchemyPermissionStore(PermissionStore):
                 (workspace_id, RESERVED_USER_PUBLIC, conversation_id),
             )
             access = ResolvedAccess(
-                is_admin=user_row is not None and user_row.is_admin,
+                is_admin=user_row is not None
+                and user_row.deleted_at is None
+                and user_row.is_admin,
                 user_grant_level=user_grant.level if user_grant is not None else None,
                 public_grant_level=public_grant.level if public_grant is not None else None,
             )

@@ -1,0 +1,72 @@
+"""Persist account generations and revocation tombstones.
+
+Revision ID: ar1b2c3d4e5f
+Revises: gh1b2c3d4e5f
+"""
+
+from __future__ import annotations
+
+import uuid
+
+import sqlalchemy as sa
+from alembic import op
+
+revision = "ar1b2c3d4e5f"
+down_revision = "gh1b2c3d4e5f"
+branch_labels = None
+depends_on = None
+
+_TABLES = ("users", "account_tokens", "device_grants", "scheduled_tasks", "hosts")
+
+
+def upgrade() -> None:
+    for name in _TABLES:
+        op.add_column(name, sa.Column("account_generation", sa.String(32), nullable=True))
+    op.add_column("users", sa.Column("deleted_at", sa.Integer(), nullable=True))
+    bind = op.get_bind()
+    users = sa.table(
+        "users",
+        sa.column("workspace_id", sa.BigInteger()),
+        sa.column("id", sa.String(128)),
+        sa.column("password_hash", sa.String(256)),
+        sa.column("account_generation", sa.String(32)),
+    )
+    # Bounded batches also work on drivers that disallow interleaved streaming cursors.
+    while True:
+        rows = bind.execute(
+            sa.select(users.c.workspace_id, users.c.id)
+            .where(users.c.password_hash.is_not(None), users.c.account_generation.is_(None))
+            .limit(1000)
+        ).all()
+        if not rows:
+            break
+        for workspace_id, user_id in rows:
+            bind.execute(
+                users.update()
+                .where(users.c.workspace_id == workspace_id, users.c.id == user_id)
+                .values(account_generation=uuid.uuid4().hex)
+            )
+    for name in _TABLES[1:]:
+        owned = sa.table(
+            name,
+            sa.column("workspace_id", sa.BigInteger()),
+            sa.column("user_id", sa.String(128)),
+            sa.column("account_generation", sa.String(32)),
+        )
+        bind.execute(
+            owned.update().values(
+                account_generation=sa.select(users.c.account_generation)
+                .where(users.c.workspace_id == owned.c.workspace_id, users.c.id == owned.c.user_id)
+                .scalar_subquery()
+            )
+        )
+
+
+def downgrade() -> None:
+    # Revoked rows must not become passwordless live identities on downgrade.
+    bind = op.get_bind()
+    users = sa.table("users", sa.column("deleted_at", sa.Integer()))
+    bind.execute(users.delete().where(users.c.deleted_at.is_not(None)))
+    op.drop_column("users", "deleted_at")
+    for name in reversed(_TABLES):
+        op.drop_column(name, "account_generation")

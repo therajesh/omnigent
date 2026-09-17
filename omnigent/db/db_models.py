@@ -379,6 +379,7 @@ class SqlUser(OmnigentBase):
     """
 
     __tablename__ = "users"
+    account_generation: Mapped[str | None] = mapped_column(String(32), nullable=True)
 
     # Tenant partition key: Databricks workspace id owning this row (0 = default). Part of the PK.
     workspace_id: Mapped[int] = mapped_column(
@@ -390,6 +391,7 @@ class SqlUser(OmnigentBase):
     )
     id: Mapped[str] = mapped_column(String(128), primary_key=True)
     is_admin: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default=false())
+    deleted_at: Mapped[int | None] = mapped_column(Integer, nullable=True)
     password_hash: Mapped[str | None] = mapped_column(String(256), nullable=True)
     created_at: Mapped[int | None] = mapped_column(Integer, nullable=True)
     last_login_at: Mapped[int | None] = mapped_column(Integer, nullable=True)
@@ -433,6 +435,7 @@ class SqlAccountToken(OmnigentBase):
     """
 
     __tablename__ = "account_tokens"
+    account_generation: Mapped[str | None] = mapped_column(String(32), nullable=True)
 
     # Tenant partition key: Databricks workspace id owning this row (0 = default). Part of the PK.
     workspace_id: Mapped[int] = mapped_column(
@@ -562,6 +565,7 @@ class SqlDeviceGrant(OmnigentBase):
     """
 
     __tablename__ = "device_grants"
+    account_generation: Mapped[str | None] = mapped_column(String(32), nullable=True)
 
     # Tenant partition key: Databricks workspace id owning this row (0 = default). Part of the PK.
     workspace_id: Mapped[int] = mapped_column(
@@ -1346,6 +1350,7 @@ class SqlHost(OmnigentBase):
     """
 
     __tablename__ = "hosts"
+    account_generation: Mapped[str | None] = mapped_column(String(32), nullable=True)
 
     # Tenant partition key: Databricks workspace id owning this row (0 = default). Part of the PK.
     workspace_id: Mapped[int] = mapped_column(
@@ -1517,6 +1522,7 @@ class SqlScheduledTask(OmnigentBase):
     """
 
     __tablename__ = "scheduled_tasks"
+    account_generation: Mapped[str | None] = mapped_column(String(32), nullable=True)
 
     # Tenant partition key: Databricks workspace id owning this row (0 = default). Part of the PK.
     workspace_id: Mapped[int] = mapped_column(

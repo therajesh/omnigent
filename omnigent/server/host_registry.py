@@ -23,13 +23,14 @@ import asyncio
 import logging
 import threading
 import time
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from typing import Any, Protocol
 
 from cachetools import TTLCache
 
 from omnigent._platform import normalize_interactive_shells
+from omnigent.db.account_authority import account_generation
 from omnigent.db.db_models import InvalidUuidError, current_workspace_id, uuid_to_bytes
 from omnigent.host.frames import HostHelloFrame, HostSkillsResultFrame
 
@@ -270,6 +271,7 @@ class HostConnection:
     outbound_queue: asyncio.Queue[str | None]
     connected_at: float
     last_frame_at: float
+    account_generation: str | None = None
     pending_launches: dict[str, asyncio.Future[dict[str, str | None]]] = field(
         default_factory=dict,
     )
@@ -349,6 +351,7 @@ class HostRegistry:
         # server re-learns it from the reconnect handshake.
         self._gateway_inference: dict[str, dict[str, bool]] = {}
         self._interactive_shells: dict[str, list[str]] = {}
+        self.launch_authorizer: Callable[[str, str, str | None, str | None], None] | None = None
 
     def register(
         self,
@@ -392,6 +395,7 @@ class HostRegistry:
             ws=ws,
             hello=hello,
             owner=owner,
+            account_generation=account_generation(owner) if owner else None,
             outbound_queue=asyncio.Queue(),
             connected_at=now,
             last_frame_at=now,
@@ -559,6 +563,17 @@ class HostRegistry:
         with self._lock:
             reported = self._interactive_shells.get(_canonical_host_id(host_id))
         return list(reported) if reported is not None else None
+
+    async def admit_launch(self, conn: HostConnection, session_id: str) -> None:
+        """Reauthorize immediately before a new runner binding is created."""
+        if self.launch_authorizer is not None:
+            await asyncio.to_thread(
+                self.launch_authorizer,
+                conn.host_id,
+                session_id,
+                conn.owner,
+                conn.account_generation,
+            )
 
     def send_text(self, conn: HostConnection, data: str) -> None:
         """Enqueue a text frame for sending to the host.
