@@ -31,10 +31,9 @@ from omnigent.llms.errors import (
 from omnigent.llms.prompt_cache import (
     PromptCacheMode,
     PromptCachePlan,
-    PromptCachePolicy,
     observe_response_usage,
     plan_prompt_cache,
-    resolve_prompt_cache_policy,
+    resolve_prompt_cache_mode,
 )
 from omnigent.llms.routing import parse_model_string
 from omnigent.llms.types import (
@@ -92,7 +91,7 @@ async def _tee_stream_for_usage(
 
 def _plan_for(
     model: str,
-    policy: PromptCachePolicy,
+    mode: PromptCacheMode,
     connection_params: dict[str, str] | None,
     *,
     instructions: str | None,
@@ -110,7 +109,7 @@ def _plan_for(
         base_url = resolve_adapter_base_url(adapter, (connection_params or {}).get("base_url"))
     return plan_prompt_cache(
         provider,
-        policy,
+        mode,
         base_url=base_url,
         stable_prefix=bool(instructions) or bool(tools),
     )
@@ -139,7 +138,7 @@ class _ResponsesNamespace:
         connection_params: dict[str, str] | None = None,
         timeout: int | None = None,
         retry: RetryPolicy | None = None,
-        prompt_cache: PromptCachePolicy | PromptCacheMode | str | None = None,
+        prompt_cache: PromptCacheMode | str | None = None,
         **kwargs: Any,
     ) -> Response | AsyncIterator[ResponseStreamEvent]:
         """
@@ -171,7 +170,7 @@ class _ResponsesNamespace:
             (timeouts, rate limits). ``None`` disables
             client-level retries. Useful for standalone calls
             outside the workflow engine.
-        :param prompt_cache: Prompt-cache policy, e.g.
+        :param prompt_cache: Prompt-cache mode, e.g.
             ``"opportunistic"``. ``None`` reads ``OMNIGENT_PROMPT_CACHE``
             (disabled when unset). Disabled requests send the uncached
             payload unchanged; cache hints never fail a request.
@@ -183,11 +182,13 @@ class _ResponsesNamespace:
         :raises PermanentLLMError: On non-retryable errors.
         :raises RetryableLLMError: When all retry attempts are
             exhausted.
+        :raises OmnigentError: If ``prompt_cache`` or
+            ``OMNIGENT_PROMPT_CACHE`` is not a known mode.
         """
 
         cache_plan = _plan_for(
             model,
-            resolve_prompt_cache_policy(prompt_cache),
+            resolve_prompt_cache_mode(prompt_cache),
             connection_params,
             instructions=instructions,
             tools=tools,
@@ -265,7 +266,7 @@ class _ResponsesNamespace:
         if isinstance(adapter, OpenAIAdapter):
             # Enabled plans reach the adapter even when no key is generated, so a
             # caller-supplied prompt_cache_key still fails open.
-            if cache_plan is not None and cache_plan.policy.enabled:
+            if cache_plan is not None and cache_plan.enabled:
                 cache_kwargs = {"prompt_cache": cache_plan}
             if reasoning and reasoning.get("effort"):
                 effort = validate_effort_or_llm_error(

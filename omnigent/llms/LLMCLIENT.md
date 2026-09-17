@@ -327,8 +327,10 @@ Model strings without a provider prefix default to `"openai"` for backward compa
 ## Prompt caching — `prompt_cache.py`
 
 Off by default. Enable per call with `responses.create(..., prompt_cache="opportunistic")`
-or process-wide with `OMNIGENT_PROMPT_CACHE=opportunistic`. Disabled requests send
-byte-identical payloads.
+or process-wide with `OMNIGENT_PROMPT_CACHE=opportunistic` (case-insensitive; unset or blank
+means `disabled`). Any other value raises `OmnigentError` (`invalid_input`, category `config`)
+before a request is sent. Disabled requests send byte-identical payloads. The supported API is
+`omnigent.llms.prompt_cache.__all__`.
 
 | Path | Mechanism | Controllable | What Omnigent does |
 |---|---|---|---|

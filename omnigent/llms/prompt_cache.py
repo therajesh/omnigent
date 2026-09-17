@@ -18,15 +18,17 @@ Two boundaries exist:
 
 Caching is off unless enabled per call (``prompt_cache=``) or process-wide via
 ``OMNIGENT_PROMPT_CACHE=opportunistic``. When off, provider payloads are
-byte-identical to the uncached request. Observations never carry prompt text,
-cache keys, or digests, so they are safe to log and export as telemetry.
+byte-identical to the uncached request. An unrecognized mode raises instead of
+silently disabling caching. Observations never carry prompt text, cache keys,
+or digests, so they are safe to log and export as telemetry.
+
+The names in ``__all__`` are the supported surface; everything else is private.
 """
 
 from __future__ import annotations
 
 import hashlib
 import json
-import logging
 import os
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
@@ -34,15 +36,36 @@ from enum import Enum
 from typing import TYPE_CHECKING, Any
 from urllib.parse import urlsplit
 
+from omnigent.errors import ErrorCategory, ErrorCode, OmnigentError
+
 if TYPE_CHECKING:
     from omnigent.llms.types import Usage
 
-_logger = logging.getLogger(__name__)
+__all__ = [
+    "NATIVE_HARNESS_CAPABILITY",
+    "PROMPT_CACHE_ENV_VAR",
+    "PromptCacheCapability",
+    "PromptCacheMechanism",
+    "PromptCacheMode",
+    "PromptCacheObservation",
+    "PromptCacheOutcome",
+    "PromptCachePlan",
+    "PromptCacheReason",
+    "apply_anthropic_cache_control",
+    "is_cache_hint_rejection",
+    "is_official_openai_base_url",
+    "observe_harness_usage",
+    "observe_response_usage",
+    "openai_prompt_cache_key",
+    "plan_prompt_cache",
+    "resolve_prompt_cache_mode",
+    "stable_prefix_digest",
+]
 
 PROMPT_CACHE_ENV_VAR = "OMNIGENT_PROMPT_CACHE"
 
 # Anthropic's default (5 minute) ephemeral cache breakpoint.
-ANTHROPIC_CACHE_CONTROL: dict[str, str] = {"type": "ephemeral"}
+_ANTHROPIC_CACHE_CONTROL: dict[str, str] = {"type": "ephemeral"}
 
 _OPENAI_API_HOST = "api.openai.com"
 _OPENAI_CACHE_KEY_PREFIX = "omnigent-"
@@ -53,7 +76,13 @@ _OPENAI_CACHE_KEY_HEX_CHARS = 32
 
 
 class PromptCacheMode(str, Enum):
-    """Whether a request may carry provider cache hints."""
+    """
+    Caller intent for prompt caching.
+
+    ``DISABLED`` sends the uncached payload unchanged; ``OPPORTUNISTIC`` adds
+    provider-supported hints and never fails the request when the provider
+    does not accept them.
+    """
 
     DISABLED = "disabled"
     OPPORTUNISTIC = "opportunistic"
@@ -92,24 +121,6 @@ class PromptCacheReason(str, Enum):
 
 
 @dataclass(frozen=True)
-class PromptCachePolicy:
-    """
-    Caller intent for prompt caching.
-
-    :param mode: ``DISABLED`` sends the uncached payload unchanged;
-        ``OPPORTUNISTIC`` adds provider-supported hints and never fails the
-        request when the provider does not accept them.
-    """
-
-    mode: PromptCacheMode = PromptCacheMode.DISABLED
-
-    @property
-    def enabled(self) -> bool:
-        """Whether cache hints may be added to requests."""
-        return self.mode is not PromptCacheMode.DISABLED
-
-
-@dataclass(frozen=True)
 class PromptCacheCapability:
     """
     What Omnigent can do about caching on one request path.
@@ -124,19 +135,19 @@ class PromptCacheCapability:
     controllable: bool
 
 
-EXPLICIT_BREAKPOINT_CAPABILITY = PromptCacheCapability(
+_EXPLICIT_BREAKPOINT_CAPABILITY = PromptCacheCapability(
     mechanism=PromptCacheMechanism.EXPLICIT_BREAKPOINTS, observable=True, controllable=True
 )
-AUTOMATIC_PREFIX_CAPABILITY = PromptCacheCapability(
+_AUTOMATIC_PREFIX_CAPABILITY = PromptCacheCapability(
     mechanism=PromptCacheMechanism.AUTOMATIC_PREFIX, observable=True, controllable=True
 )
-AUTOMATIC_PREFIX_OBSERVE_ONLY_CAPABILITY = PromptCacheCapability(
+_AUTOMATIC_PREFIX_OBSERVE_ONLY_CAPABILITY = PromptCacheCapability(
     mechanism=PromptCacheMechanism.AUTOMATIC_PREFIX, observable=True, controllable=False
 )
 NATIVE_HARNESS_CAPABILITY = PromptCacheCapability(
     mechanism=PromptCacheMechanism.VENDOR_MANAGED, observable=True, controllable=False
 )
-UNSUPPORTED_CAPABILITY = PromptCacheCapability(
+_UNSUPPORTED_CAPABILITY = PromptCacheCapability(
     mechanism=PromptCacheMechanism.NONE, observable=False, controllable=False
 )
 
@@ -150,7 +161,7 @@ class PromptCachePlan:
     hints and the request was retried without them.
 
     :param capability: What the request path supports.
-    :param policy: The resolved caller policy.
+    :param mode: The resolved caller mode.
     :param reason: Why hints are or are not applied.
     :param rejected: Set when the provider refused the hints.
     :param stable_prefix: Whether the request has tools or instructions to
@@ -158,16 +169,21 @@ class PromptCachePlan:
     """
 
     capability: PromptCacheCapability
-    policy: PromptCachePolicy
+    mode: PromptCacheMode
     reason: PromptCacheReason
     rejected: bool = False
     stable_prefix: bool = True
 
     @property
+    def enabled(self) -> bool:
+        """Whether the caller asked for caching."""
+        return self.mode is not PromptCacheMode.DISABLED
+
+    @property
     def apply(self) -> bool:
         """Whether the adapter should add cache hints to the payload."""
         return (
-            self.policy.enabled
+            self.enabled
             and self.capability.controllable
             and self.stable_prefix
             and not self.rejected
@@ -214,31 +230,33 @@ class PromptCacheObservation:
         return attrs
 
 
-def resolve_prompt_cache_policy(
-    value: PromptCachePolicy | PromptCacheMode | str | None,
-) -> PromptCachePolicy:
+def resolve_prompt_cache_mode(value: PromptCacheMode | str | None) -> PromptCacheMode:
     """
-    Resolve a caller-supplied policy, falling back to the environment.
+    Resolve a caller-supplied mode, falling back to ``OMNIGENT_PROMPT_CACHE``.
 
-    Unknown values resolve to ``DISABLED`` with a warning so a typo can never
-    fail a request.
+    Matching ignores case and surrounding whitespace; unset or blank means
+    ``DISABLED``. A misconfigured machine should not silently lose caching, so
+    any other value raises.
 
-    :param value: A policy, mode, mode string, or ``None`` to read
-        ``OMNIGENT_PROMPT_CACHE``.
-    :returns: The resolved policy.
+    :param value: A mode, mode string, or ``None`` to read the environment.
+    :returns: The resolved mode.
+    :raises OmnigentError: If the value is not a known mode.
     """
-    if isinstance(value, PromptCachePolicy):
-        return value
     if isinstance(value, PromptCacheMode):
-        return PromptCachePolicy(mode=value)
+        return value
+    source = "prompt_cache" if value is not None else PROMPT_CACHE_ENV_VAR
     raw = value if value is not None else os.environ.get(PROMPT_CACHE_ENV_VAR)
     if raw is None or not raw.strip():
-        return PromptCachePolicy()
+        return PromptCacheMode.DISABLED
     try:
-        return PromptCachePolicy(mode=PromptCacheMode(raw.strip().lower()))
+        return PromptCacheMode(raw.strip().lower())
     except ValueError:
-        _logger.warning("Ignoring unknown prompt cache mode; prompt caching stays disabled")
-        return PromptCachePolicy()
+        allowed = ", ".join(mode.value for mode in PromptCacheMode)
+        raise OmnigentError(
+            f"Invalid {source} value {raw.strip()[:40]!r}; expected one of: {allowed}",
+            code=ErrorCode.INVALID_INPUT,
+            category=ErrorCategory.CONFIG,
+        ) from None
 
 
 def is_official_openai_base_url(base_url: str | None) -> bool:
@@ -263,7 +281,7 @@ def is_official_openai_base_url(base_url: str | None) -> bool:
 
 def plan_prompt_cache(
     provider: str,
-    policy: PromptCachePolicy,
+    mode: PromptCacheMode,
     *,
     base_url: str | None = None,
     stable_prefix: bool = True,
@@ -272,32 +290,32 @@ def plan_prompt_cache(
     Decide how one direct-provider request may use prompt caching.
 
     :param provider: Routed provider name, e.g. ``"anthropic"``.
-    :param policy: The resolved caller policy.
+    :param mode: The resolved caller mode.
     :param base_url: The adapter's effective base URL (per-call override or
         adapter default). OpenAI hints are only sent to OpenAI's own API.
     :param stable_prefix: Whether the request has tools or instructions.
     :returns: The plan the client passes to the adapter.
     """
     if provider == "anthropic":
-        capability = EXPLICIT_BREAKPOINT_CAPABILITY
+        capability = _EXPLICIT_BREAKPOINT_CAPABILITY
         reason = PromptCacheReason.APPLIED
     elif provider == "openai":
         if not is_official_openai_base_url(base_url):
             # Gateways that proxy the Responses API may reject unknown fields.
-            capability = AUTOMATIC_PREFIX_OBSERVE_ONLY_CAPABILITY
+            capability = _AUTOMATIC_PREFIX_OBSERVE_ONLY_CAPABILITY
             reason = PromptCacheReason.CUSTOM_ENDPOINT
         else:
-            capability = AUTOMATIC_PREFIX_CAPABILITY
+            capability = _AUTOMATIC_PREFIX_CAPABILITY
             reason = PromptCacheReason.APPLIED
     else:
-        capability = UNSUPPORTED_CAPABILITY
+        capability = _UNSUPPORTED_CAPABILITY
         reason = PromptCacheReason.UNSUPPORTED_PROVIDER
     if capability.controllable and not stable_prefix:
         reason = PromptCacheReason.NO_STABLE_PREFIX
-    if not policy.enabled and capability.controllable:
+    if mode is PromptCacheMode.DISABLED and capability.controllable:
         reason = PromptCacheReason.DISABLED
     return PromptCachePlan(
-        capability=capability, policy=policy, reason=reason, stable_prefix=stable_prefix
+        capability=capability, mode=mode, reason=reason, stable_prefix=stable_prefix
     )
 
 
@@ -355,11 +373,11 @@ def apply_anthropic_cache_control(payload: Mapping[str, Any]) -> dict[str, Any]:
     cached = dict(payload)
     tools = payload.get("tools")
     if isinstance(tools, list) and tools and isinstance(tools[-1], dict):
-        cached["tools"] = [*tools[:-1], {**tools[-1], "cache_control": ANTHROPIC_CACHE_CONTROL}]
+        cached["tools"] = [*tools[:-1], {**tools[-1], "cache_control": _ANTHROPIC_CACHE_CONTROL}]
     system = payload.get("system")
     if isinstance(system, str) and system:
         cached["system"] = [
-            {"type": "text", "text": system, "cache_control": ANTHROPIC_CACHE_CONTROL}
+            {"type": "text", "text": system, "cache_control": _ANTHROPIC_CACHE_CONTROL}
         ]
     return cached
 

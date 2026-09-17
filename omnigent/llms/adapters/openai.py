@@ -575,9 +575,7 @@ class OpenAIAdapter(OpenAICompatibleAdapter):
         )
 
         cached_payload: dict[str, Any] | None = None
-        cache_plan = (
-            prompt_cache if prompt_cache is not None and prompt_cache.policy.enabled else None
-        )
+        cache_plan = prompt_cache if prompt_cache is not None and prompt_cache.enabled else None
         if cache_plan is not None:
             if "prompt_cache_key" in payload:
                 # A caller-supplied key wins, but still fails open if refused.

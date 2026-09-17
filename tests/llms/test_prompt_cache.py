@@ -9,13 +9,18 @@ from __future__ import annotations
 
 import json
 import logging
+import sys
 from collections.abc import Callable
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any
 
 import httpx
 import pytest
 
+import omnigent.llms.adapters as llm_adapters_module
+import omnigent.llms.prompt_cache as prompt_cache_module
+from omnigent.errors import ErrorCategory, ErrorCode, OmnigentError
 from omnigent.inner.claude_native_executor import ClaudeNativeExecutor
 from omnigent.inner.claude_sdk_executor import ClaudeSDKExecutor
 from omnigent.inner.codex_executor import (
@@ -36,7 +41,6 @@ from omnigent.llms.prompt_cache import (
     PromptCacheMode,
     PromptCacheObservation,
     PromptCacheOutcome,
-    PromptCachePolicy,
     PromptCacheReason,
     apply_anthropic_cache_control,
     is_cache_hint_rejection,
@@ -44,7 +48,7 @@ from omnigent.llms.prompt_cache import (
     observe_harness_usage,
     openai_prompt_cache_key,
     plan_prompt_cache,
-    resolve_prompt_cache_policy,
+    resolve_prompt_cache_mode,
     stable_prefix_digest,
 )
 from omnigent.llms.types import Response, ResponseCompletedEvent, Usage
@@ -116,6 +120,20 @@ class _Provider:
         return [json.loads(body) for body in self.bodies]
 
 
+_IMPORTED_OMNIGENT_MODULES = {
+    name: module for name, module in sys.modules.items() if name.startswith("omnigent")
+}
+
+
+@pytest.fixture(autouse=True)
+def _pin_omnigent_modules(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Undo module purges by other tests so adapter classes match this file's imports."""
+    for name, module in _IMPORTED_OMNIGENT_MODULES.items():
+        if sys.modules.get(name) is not module:
+            monkeypatch.setitem(sys.modules, name, module)
+    monkeypatch.setattr(llm_adapters_module, "_adapter_cache", {})
+
+
 @pytest.fixture
 def provider(monkeypatch: pytest.MonkeyPatch) -> Callable[..., _Provider]:
     real_async_client = httpx.AsyncClient
@@ -141,23 +159,75 @@ async def _create(**kwargs: Any) -> Response:
     return result
 
 
-# ── Policy resolution ────────────────────────────────────────
+# ── Mode resolution and public surface ───────────────────────
 
 
-def test_policy_defaults_to_disabled(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.delenv(PROMPT_CACHE_ENV_VAR, raising=False)
-    assert resolve_prompt_cache_policy(None) == PromptCachePolicy(PromptCacheMode.DISABLED)
+@pytest.mark.parametrize("raw", [None, "", "   "])
+def test_mode_defaults_to_disabled(monkeypatch: pytest.MonkeyPatch, raw: str | None) -> None:
+    if raw is None:
+        monkeypatch.delenv(PROMPT_CACHE_ENV_VAR, raising=False)
+    else:
+        monkeypatch.setenv(PROMPT_CACHE_ENV_VAR, raw)
+    assert resolve_prompt_cache_mode(None) is PromptCacheMode.DISABLED
 
 
-def test_policy_reads_env_and_explicit_values(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setenv(PROMPT_CACHE_ENV_VAR, "Opportunistic")
-    assert resolve_prompt_cache_policy(None).enabled
-    assert not resolve_prompt_cache_policy("disabled").enabled
-    assert resolve_prompt_cache_policy(PromptCacheMode.OPPORTUNISTIC).enabled
+def test_mode_reads_env_and_explicit_values(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv(PROMPT_CACHE_ENV_VAR, " Opportunistic ")
+    assert resolve_prompt_cache_mode(None) is PromptCacheMode.OPPORTUNISTIC
+    assert resolve_prompt_cache_mode("disabled") is PromptCacheMode.DISABLED
+    assert (
+        resolve_prompt_cache_mode(PromptCacheMode.OPPORTUNISTIC) is PromptCacheMode.OPPORTUNISTIC
+    )
 
 
-def test_unknown_policy_value_fails_open_to_disabled() -> None:
-    assert resolve_prompt_cache_policy("always-please") == PromptCachePolicy()
+@pytest.mark.parametrize(("env", "arg"), [("always-please", None), (None, "on")])
+def test_invalid_mode_raises_config_error(
+    monkeypatch: pytest.MonkeyPatch,
+    env: str | None,
+    arg: str | None,
+) -> None:
+    if env is None:
+        monkeypatch.delenv(PROMPT_CACHE_ENV_VAR, raising=False)
+    else:
+        monkeypatch.setenv(PROMPT_CACHE_ENV_VAR, env)
+    with pytest.raises(OmnigentError) as excinfo:
+        resolve_prompt_cache_mode(arg)
+    assert excinfo.value.code == ErrorCode.INVALID_INPUT
+    assert excinfo.value.category is ErrorCategory.CONFIG
+    message = str(excinfo.value)
+    assert (PROMPT_CACHE_ENV_VAR if env else "prompt_cache") in message
+    assert "disabled, opportunistic" in message
+
+
+async def test_invalid_env_mode_fails_before_any_provider_request(
+    provider: Callable[..., _Provider],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    recorder = provider(httpx.Response(200, json=_anthropic_body()))
+    monkeypatch.setenv(PROMPT_CACHE_ENV_VAR, "opportunstic")
+    with pytest.raises(OmnigentError, match=PROMPT_CACHE_ENV_VAR):
+        await _create(
+            input=_input(),
+            instructions=_INSTRUCTIONS,
+            model="anthropic/claude-test",
+            connection_params={"api_key": "k"},
+        )
+    assert recorder.bodies == []
+
+
+def test_public_surface_is_declared() -> None:
+    exported = set(prompt_cache_module.__all__)
+    assert all(hasattr(prompt_cache_module, name) for name in exported)
+    public = {
+        name
+        for name, value in vars(prompt_cache_module).items()
+        if not name.startswith("_")
+        and getattr(value, "__module__", prompt_cache_module.__name__)
+        == prompt_cache_module.__name__
+        and name not in {"annotations", "TYPE_CHECKING", "Any"}
+        and not isinstance(value, type(sys))
+    }
+    assert public == exported
 
 
 # ── Payloads: disabled is byte-identical ─────────────────────
@@ -186,7 +256,7 @@ async def test_anthropic_disabled_payload_is_byte_identical(
         "stream": stream,
         "connection_params": {"api_key": "k"},
     }
-    for policy in (None, "disabled", PromptCachePolicy()):
+    for policy in (None, "disabled", PromptCacheMode.DISABLED):
         result = await Client().responses.create(**kwargs, prompt_cache=policy)
         if stream:
             assert not isinstance(result, Response)
@@ -519,9 +589,7 @@ async def test_openai_adapter_level_custom_url_gets_no_cache_key(
 )
 def test_official_openai_base_url_detection(endpoint: str | None, official: bool) -> None:
     assert is_official_openai_base_url(endpoint) is official
-    plan = plan_prompt_cache(
-        "openai", PromptCachePolicy(PromptCacheMode.OPPORTUNISTIC), base_url=endpoint
-    )
+    plan = plan_prompt_cache("openai", PromptCacheMode.OPPORTUNISTIC, base_url=endpoint)
     assert plan.apply is official
 
 
@@ -666,7 +734,7 @@ async def test_openai_key_ignores_dynamic_suffix_and_tracks_stable_prefix(
 
 
 def test_unsupported_provider_bypasses() -> None:
-    plan = plan_prompt_cache("gemini", PromptCachePolicy(PromptCacheMode.OPPORTUNISTIC))
+    plan = plan_prompt_cache("gemini", PromptCacheMode.OPPORTUNISTIC)
     assert not plan.apply
     assert plan.reason is PromptCacheReason.UNSUPPORTED_PROVIDER
 
@@ -970,3 +1038,172 @@ def test_executor_adapter_records_cache_only_for_declaring_executors() -> None:
     undeclared = _RecordingSpan()
     _record_harness_prompt_cache(undeclared, Executor(), usage)
     assert undeclared.attributes == {}
+
+
+# ── End-to-end: machine config -> plan -> payload -> observation ─────
+
+
+def _conversation(turn: int) -> list[dict[str, Any]]:
+    items: list[dict[str, Any]] = []
+    for index in range(1, turn + 1):
+        items.append({"role": "user", "content": f"question {index}"})
+        if index < turn:
+            items.append({"role": "assistant", "content": f"answer {index}"})
+    return items
+
+
+def _span_attributes(observation: PromptCacheObservation | None) -> dict[str, object]:
+    assert observation is not None
+    span = _RecordingSpan()
+    record_prompt_cache(span, observation)  # type: ignore[arg-type]
+    return span.attributes
+
+
+async def test_e2e_anthropic_env_enabled_write_hit_then_fail_open(
+    provider: Callable[..., _Provider],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    recorder = provider(
+        httpx.Response(200, json=_anthropic_body(cache_creation_input_tokens=1500)),
+        httpx.Response(200, json=_anthropic_body(cache_read_input_tokens=1500)),
+        httpx.Response(400, json={"error": {"message": "system.0.cache_control: not allowed"}}),
+        httpx.Response(200, json=_anthropic_body()),
+    )
+    monkeypatch.setenv(PROMPT_CACHE_ENV_VAR, "opportunistic")
+    common: dict[str, Any] = {
+        "instructions": _INSTRUCTIONS,
+        "model": "anthropic/claude-test",
+        "tools": _TOOLS,
+        "connection_params": {"api_key": "k"},
+    }
+
+    write = await _create(input=_conversation(1), **common)
+    hit = await _create(input=_conversation(2), **common)
+    fallback = await _create(input=_conversation(3), **common)
+    uncached = await _create(input=_conversation(3), prompt_cache="disabled", **common)
+
+    write_body, hit_body, rejected_body, retry_body, disabled_body = recorder.bodies
+    for body in (write_body, hit_body, rejected_body):
+        payload = json.loads(body)
+        assert payload["system"][0]["cache_control"] == {"type": "ephemeral"}
+        assert payload["tools"][-1]["cache_control"] == {"type": "ephemeral"}
+        assert "cache_control" not in json.dumps(payload["messages"])
+    # The fallback is exactly the request caching-off would have sent.
+    assert retry_body == disabled_body
+    assert b"cache_control" not in retry_body
+
+    assert _span_attributes(write.prompt_cache) == {
+        "omnigent.prompt_cache.mechanism": "explicit_breakpoints",
+        "omnigent.prompt_cache.outcome": "write",
+        "omnigent.prompt_cache.controllable": True,
+        "omnigent.prompt_cache.reason": "applied",
+        "omnigent.prompt_cache.write_tokens": 1500,
+    }
+    assert hit.prompt_cache is not None
+    assert hit.prompt_cache.outcome is PromptCacheOutcome.HIT
+    assert hit.usage is not None
+    assert hit.usage.to_cost_usage()["cache_read_input_tokens"] == 1500
+    assert fallback.prompt_cache is not None
+    assert fallback.prompt_cache.outcome is PromptCacheOutcome.BYPASS
+    assert fallback.prompt_cache.reason is PromptCacheReason.PROVIDER_REJECTED
+    assert uncached.prompt_cache is not None
+    assert uncached.prompt_cache.reason is PromptCacheReason.DISABLED
+
+
+async def test_e2e_openai_env_enabled_miss_hit_then_fail_open(
+    provider: Callable[..., _Provider],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    recorder = provider(
+        httpx.Response(200, json=_openai_body(cached=0)),
+        httpx.Response(200, json=_openai_body(cached=1792)),
+        httpx.Response(400, json={"error": {"message": "Unknown parameter: 'prompt_cache_key'."}}),
+        httpx.Response(200, json=_openai_body(cached=1792)),
+    )
+    monkeypatch.setenv(PROMPT_CACHE_ENV_VAR, "opportunistic")
+    common: dict[str, Any] = {
+        "instructions": _INSTRUCTIONS,
+        "model": "openai/gpt-test",
+        "tools": _TOOLS,
+        "connection_params": {"api_key": "k"},
+    }
+
+    miss = await _create(input=_conversation(1), **common)
+    hit = await _create(input=_conversation(2), **common)
+    fallback = await _create(input=_conversation(3), **common)
+    await _create(input=_conversation(3), prompt_cache="disabled", **common)
+
+    miss_body, hit_body, rejected_body, retry_body, disabled_body = recorder.json_bodies()
+    keys = {body["prompt_cache_key"] for body in (miss_body, hit_body, rejected_body)}
+    assert len(keys) == 1
+    assert retry_body == disabled_body
+    assert recorder.bodies[3] == recorder.bodies[4]
+    assert "prompt_cache_key" not in retry_body
+
+    assert miss.prompt_cache is not None
+    assert miss.prompt_cache.outcome is PromptCacheOutcome.MISS
+    assert _span_attributes(hit.prompt_cache) == {
+        "omnigent.prompt_cache.mechanism": "automatic_prefix",
+        "omnigent.prompt_cache.outcome": "hit",
+        "omnigent.prompt_cache.controllable": True,
+        "omnigent.prompt_cache.reason": "applied",
+        "omnigent.prompt_cache.read_tokens": 1792,
+    }
+    assert hit.usage is not None
+    assert hit.usage.to_cost_usage()["input_tokens"] == 208
+    # OpenAI still caches the common prefix after dropping the routing key.
+    assert _span_attributes(fallback.prompt_cache) == {
+        "omnigent.prompt_cache.mechanism": "automatic_prefix",
+        "omnigent.prompt_cache.outcome": "hit",
+        "omnigent.prompt_cache.controllable": True,
+        "omnigent.prompt_cache.reason": "provider_rejected",
+        "omnigent.prompt_cache.read_tokens": 1792,
+    }
+
+
+# ── Native harnesses stay telemetry-only ─────────────────────
+
+_NATIVE_HARNESS_SOURCES = [
+    "omnigent/inner/claude_native_executor.py",
+    "omnigent/inner/claude_sdk_executor.py",
+    "omnigent/inner/claude_gateway_shim.py",
+    "omnigent/inner/codex_executor.py",
+    "omnigent/inner/codex_native_executor.py",
+    "omnigent/harnesses/claude_native",
+    "omnigent/harnesses/codex_native",
+]
+_PAYLOAD_CONTROL_NAMES = (
+    "apply_anthropic_cache_control",
+    "openai_prompt_cache_key",
+    "plan_prompt_cache",
+    "PromptCachePlan",
+)
+
+
+def test_native_harness_sources_never_touch_cache_payload_controls() -> None:
+    root = Path(prompt_cache_module.__file__).resolve().parents[2]
+    files: list[Path] = []
+    for relative in _NATIVE_HARNESS_SOURCES:
+        path = root / relative
+        assert path.exists(), relative
+        files.extend(sorted(path.rglob("*.py")) if path.is_dir() else [path])
+    offenders = [
+        f"{file.relative_to(root)}:{name}"
+        for file in files
+        for name in _PAYLOAD_CONTROL_NAMES
+        if name in file.read_text(encoding="utf-8")
+    ]
+    assert offenders == []
+
+
+def test_harness_cache_recording_leaves_usage_untouched() -> None:
+    from omnigent.runtime.harnesses._executor_adapter import _record_harness_prompt_cache
+
+    usage = {"input_tokens": 10, "output_tokens": 2, "cache_creation_input_tokens": 300}
+    snapshot = dict(usage)
+    for executor_cls in (ClaudeNativeExecutor, ClaudeSDKExecutor, CodexNativeExecutor):
+        span = _RecordingSpan()
+        _record_harness_prompt_cache(span, object.__new__(executor_cls), usage)
+        assert usage == snapshot
+        assert span.attributes["omnigent.prompt_cache.controllable"] is False
+        assert span.attributes["omnigent.prompt_cache.outcome"] == "write"
