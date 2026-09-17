@@ -351,7 +351,9 @@ class HostRegistry:
         # server re-learns it from the reconnect handshake.
         self._gateway_inference: dict[str, dict[str, bool]] = {}
         self._interactive_shells: dict[str, list[str]] = {}
-        self.launch_authorizer: Callable[[str, str, str | None, str | None], None] | None = None
+        self.launch_authorizer: Callable[[str, str, str | None, str | None, bool], None] | None = (
+            None
+        )
 
     def register(
         self,
@@ -564,7 +566,9 @@ class HostRegistry:
             reported = self._interactive_shells.get(_canonical_host_id(host_id))
         return list(reported) if reported is not None else None
 
-    async def admit_launch(self, conn: HostConnection, session_id: str) -> None:
+    async def admit_launch(
+        self, conn: HostConnection, session_id: str, *, allow_unbound: bool = False
+    ) -> None:
         """Reauthorize immediately before a new runner binding is created."""
         if self.launch_authorizer is not None:
             await asyncio.to_thread(
@@ -573,6 +577,7 @@ class HostRegistry:
                 session_id,
                 conn.owner,
                 conn.account_generation,
+                allow_unbound,
             )
 
     def send_text(self, conn: HostConnection, data: str) -> None:

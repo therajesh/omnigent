@@ -19,6 +19,11 @@ scheduled tasks, and hosts retain their owner's generation. An explicitly saved
 null generation means an external identity; it cannot acquire a subsequently
 registered account's authority.
 
+Session-permission cache keys include the authenticated generation. A new
+registration cannot reuse another replica's old member or administrator cache
+entry. Task listing, individual task access, and run-history access also check
+the saved generation before returning private data.
+
 Authenticated requests capture account authority in a workspace-scoped
 ContextVar. Async tasks and `asyncio.to_thread` inherit it. Durable scheduled
 work restores its saved generation. Context changes made inside a worker do not
@@ -38,6 +43,8 @@ the full administrator/actor/target set in that order before enforcing the
 last-admin invariant. PostgreSQL uses locking reads; SQLite uses immediate
 write transactions. Captured generations are checked under those locks, so a
 request authenticated earlier cannot write authority into a replacement account.
+MySQL deadlock victims retry the entire rolled-back database transaction with
+bounded backoff, including concurrent first writes that contend on missing rows.
 
 Deletion removes session permissions, saved provider connections, projects,
 project ordering, and outstanding invitations/magic links created for or by the
@@ -51,6 +58,9 @@ replacement from escaping between bulk statements. Launch credentials are
 cleared. Managed-host tombstones preserve pending sandbox IDs until the existing
 provider cleanup worker confirms termination. Provider destruction happens
 outside the account transaction; failures leave cleanup retriable.
+Registration failures after provisioning also attempt to terminate the new
+sandbox. An ID already retained for active work or pending cleanup remains under
+the existing host lifecycle.
 
 ## Launch admission
 
@@ -84,6 +94,9 @@ backfills their saved authority. Valid refresh grants retain their secrets and
 can renew into generation-bearing JWTs. Existing ordinary cookies/JWTs lack the
 claim and require login again. Existing OAuth connection handshakes should be
 restarted after upgrade.
+
+CockroachDB commits the new columns before reading them for backfill. That
+upgrade can resume after an interruption between schema commit and backfill.
 
 Accounts-mode deployments require a coordinated stop/upgrade/start of every
 server and scheduler sharing the database. Mixed old/new versions are unsafe:

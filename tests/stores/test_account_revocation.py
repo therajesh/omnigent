@@ -275,3 +275,25 @@ def test_concurrent_admin_deletions_preserve_an_active_admin(db_uri: str) -> Non
         b = pool.submit(delete, bob, alice)
         assert sorted([a.result(timeout=10), b.result(timeout=10)]) == [False, True]
     assert sum(accounts.is_admin(user) for user in ("alice", "bob")) == 1
+
+
+def test_launch_admission_requires_binding_unless_initial_bind(db_uri: str) -> None:
+    from omnigent.stores.conversation_store.sqlalchemy_store import SqlAlchemyConversationStore
+
+    accounts = SqlAlchemyAccountStore(db_uri)
+    account = accounts.create_user_with_password("alice", "test-password-hash")
+    hosts = HostStore(db_uri)
+    host_id = uuid.uuid4().hex
+    hosts.upsert_on_connect(host_id, "laptop", "alice")
+    conversations = SqlAlchemyConversationStore(db_uri)
+    conv = conversations.create_conversation()
+    with pytest.raises(OmnigentError, match="bound"):
+        hosts.admit_launch(host_id, conv.id, "alice", account.account_generation)
+    hosts.admit_launch(host_id, conv.id, "alice", account.account_generation, allow_unbound=True)
+    conversations.set_host_id(conv.id, host_id, workspace="/tmp/workspace")
+    hosts.admit_launch(host_id, conv.id, "alice", account.account_generation)
+    assert accounts.delete_user("alice") is True
+    with pytest.raises(OmnigentError, match="revoked"):
+        hosts.admit_launch(
+            host_id, conv.id, "alice", account.account_generation, allow_unbound=True
+        )

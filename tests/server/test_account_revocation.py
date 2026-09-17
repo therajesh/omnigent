@@ -326,3 +326,164 @@ def test_oauth_connection_state_cannot_cross_username_reuse(setup_app):
         in replacement.get(callback, params=params, follow_redirects=False).headers["location"]
     )
     assert completed == ["alice"]
+
+
+@pytest.mark.parametrize("cached_admin", [False, True])
+def test_replacement_account_cannot_reuse_replica_permission_cache(setup_app, cached_admin):
+    from omnigent.server.auth import create_auth_provider
+    from omnigent.stores.permission_store.sqlalchemy_store import SqlAlchemyPermissionStore
+
+    admin, alice, stores, create_app = setup_app
+    if cached_admin:
+        stores["account_store"].set_admin("alice", True)
+    created = create_session(admin if cached_admin else alice)
+    assert created.status_code == 201
+    session_id = created.json()["session_id"]
+    replica_args = dict(stores)
+    replica_args["auth_provider"] = create_auth_provider()
+    permissions = SqlAlchemyPermissionStore(stores["permission_store"].storage_location)
+    permissions._resolve_cache_ttl_s = 60
+    replica_args["permission_store"] = permissions
+    replica = TestClient(create_app(**replica_args))
+    replica.cookies.update(alice.cookies)
+    path = f"/v1/sessions/{session_id}/items"
+    assert replica.get(path).status_code == 200
+    assert permissions._resolve_cache
+    assert admin.delete("/auth/users/alice").status_code == 204
+    invite = admin.post("/auth/invite", json={}).json()["token"]
+    replacement = TestClient(admin.app)
+    assert (
+        replacement.post(
+            "/auth/register",
+            json={"invite": invite, "username": "alice", "password": "new-password-1234"},
+        ).status_code
+        == 200
+    )
+    replica.cookies.clear()
+    replica.cookies.update(replacement.cookies)
+    assert replica.get("/auth/me").status_code == 200
+    assert replica.get(path).status_code in (403, 404)
+
+
+def test_replacement_account_cannot_read_predecessor_tasks(setup_app):
+    import uuid
+
+    from omnigent.server.routes.scheduled_tasks import create_scheduled_tasks_router
+    from omnigent.stores.scheduled_task_store.sqlalchemy_store import SqlAlchemyScheduledTaskStore
+
+    admin, alice, stores, _ = setup_app
+    tasks = SqlAlchemyScheduledTaskStore(stores["account_store"].storage_location)
+    admin.app.include_router(
+        create_scheduled_tasks_router(
+            tasks,
+            agent_store=stores["agent_store"],
+            conversation_store=stores["conversation_store"],
+            auth_provider=stores["auth_provider"],
+        ),
+        prefix="/v1",
+    )
+    task = tasks.create(
+        uuid.uuid4().hex,
+        "private task",
+        "private predecessor prompt",
+        "FREQ=DAILY",
+        "alice",
+        uuid.uuid4().hex,
+        "UTC",
+        workspace="/private/workspace",
+    )
+    tasks.create_run(
+        run_id=uuid.uuid4().hex,
+        scheduled_task_id=task.id,
+        status="succeeded",
+        scheduled_at=100,
+    )
+    path = f"/v1/scheduled-tasks/{task.id}"
+    assert alice.get(path).status_code == 200
+    assert alice.get(path + "/runs").status_code == 200
+    assert admin.delete("/auth/users/alice").status_code == 204
+    invite = admin.post("/auth/invite", json={}).json()["token"]
+    replacement = TestClient(admin.app)
+    assert (
+        replacement.post(
+            "/auth/register",
+            json={"invite": invite, "username": "alice", "password": "new-password-1234"},
+        ).status_code
+        == 200
+    )
+    listing = replacement.get("/v1/scheduled-tasks")
+    assert listing.status_code == 200 and listing.json()["scheduled_tasks"] == []
+    assert replacement.get(path).status_code == 404
+    assert replacement.get(path + "/runs").status_code == 404
+
+
+@pytest.mark.parametrize("inline", [False, True])
+def test_http_launch_rechecks_revocation_before_binding(setup_app, monkeypatch, inline):
+    import uuid
+
+    from omnigent.db.account_authority import account_authority_scope
+    from omnigent.host.frames import HostHelloFrame
+    from omnigent.server.routes import _host_launch, _workspace_validation, hosts
+
+    admin, alice, stores, _ = setup_app
+    created = create_session(alice)
+    assert created.status_code == 201
+    host_id = uuid.uuid4().hex
+    host = stores["host_store"].upsert_on_connect(host_id, "launch-host", "alice")
+    registry = admin.app.state.host_registry
+    with account_authority_scope("alice", host.account_generation):
+        conn = registry.register(
+            host_id,
+            object(),
+            HostHelloFrame(version="0.15.0", frame_protocol_version=1, name="launch-host"),
+            "alice",
+        )
+
+    async def stat(**kwargs):
+        return {
+            "status": "ok",
+            "exists": True,
+            "type": "directory",
+            "canonical_path": kwargs["path"],
+        }
+
+    monkeypatch.setattr(_workspace_validation, "_ask_host_stat", stat)
+    reached, resume = Event(), Event()
+    snapshots = []
+    original = _host_launch.resolve_host_launch
+
+    def paused(**kwargs):
+        target = original(**kwargs)
+        snapshots.append(target.conv.id)
+        reached.set()
+        assert resume.wait(15)
+        return target
+
+    monkeypatch.setattr(_host_launch, "resolve_host_launch", paused)
+    monkeypatch.setattr(hosts, "resolve_host_launch", paused)
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        if inline:
+            pending = pool.submit(
+                alice.post,
+                "/v1/sessions",
+                json={
+                    "agent_id": created.json()["agent_id"],
+                    "host_id": host_id,
+                    "workspace": "/tmp/workspace",
+                },
+            )
+        else:
+            pending = pool.submit(
+                alice.post,
+                f"/v1/hosts/{host_id}/runners",
+                json={"session_id": created.json()["session_id"], "workspace": "/tmp/workspace"},
+            )
+        try:
+            assert reached.wait(15)
+            assert admin.delete("/auth/users/alice").status_code == 204
+        finally:
+            resume.set()
+        response = pending.result(timeout=15)
+    assert response.status_code == 401, response.text
+    assert conn.outbound_queue.empty()
+    assert stores["conversation_store"].get_conversation(snapshots[0]).runner_id is None

@@ -1078,7 +1078,12 @@ class HostStore:
             return _row_to_host(row)
 
     def admit_launch(
-        self, host_id: str, session_id: str, owner: str | None, generation: str | None
+        self,
+        host_id: str,
+        session_id: str,
+        owner: str | None,
+        generation: str | None,
+        allow_unbound: bool = False,
     ) -> None:
         """Order final launch authorization with account deletion across replicas."""
 
@@ -1106,7 +1111,9 @@ class HostStore:
                 )
                 .with_for_update()
             ).scalar_one_or_none()
-            if meta is None or meta.host_id != host_id:
+            if meta is None or (
+                meta.host_id != host_id and not (allow_unbound and meta.host_id is None)
+            ):
                 raise OmnigentError(
                     "session is no longer bound to this host", code=ErrorCode.UNAUTHORIZED
                 )

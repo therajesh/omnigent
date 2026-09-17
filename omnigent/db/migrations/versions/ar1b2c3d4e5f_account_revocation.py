@@ -20,10 +20,23 @@ _TABLES = ("users", "account_tokens", "device_grants", "scheduled_tasks", "hosts
 
 
 def upgrade() -> None:
-    for name in _TABLES:
-        op.add_column(name, sa.Column("account_generation", sa.String(32), nullable=True))
-    op.add_column("users", sa.Column("deleted_at", sa.Integer(), nullable=True))
     bind = op.get_bind()
+    is_crdb = bind.dialect.name == "cockroachdb"
+    for name in _TABLES:
+        if is_crdb and "account_generation" in {
+            column["name"] for column in sa.inspect(bind).get_columns(name)
+        }:
+            continue
+        op.add_column(name, sa.Column("account_generation", sa.String(32), nullable=True))
+    if not is_crdb or "deleted_at" not in {
+        column["name"] for column in sa.inspect(bind).get_columns("users")
+    }:
+        op.add_column("users", sa.Column("deleted_at", sa.Integer(), nullable=True))
+    if is_crdb:
+        # CRDB publishes new columns at commit. The column checks above let
+        # startup resume if it stops between this commit and the backfill.
+        bind.commit()
+        bind.execute(sa.text("SET TRANSACTION ISOLATION LEVEL SERIALIZABLE"))
     users = sa.table(
         "users",
         sa.column("workspace_id", sa.BigInteger()),
@@ -67,6 +80,8 @@ def downgrade() -> None:
     bind = op.get_bind()
     users = sa.table("users", sa.column("deleted_at", sa.Integer()))
     bind.execute(users.delete().where(users.c.deleted_at.is_not(None)))
-    op.drop_column("users", "deleted_at")
+    with op.batch_alter_table("users") as batch:
+        batch.drop_column("deleted_at")
     for name in reversed(_TABLES):
-        op.drop_column(name, "account_generation")
+        with op.batch_alter_table(name) as batch:
+            batch.drop_column("account_generation")

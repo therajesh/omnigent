@@ -17,7 +17,7 @@ from sqlalchemy.engine import CursorResult
 from sqlalchemy.orm import Session
 from sqlalchemy.sql.dml import Insert
 
-from omnigent.db.account_authority import require_active_account
+from omnigent.db.account_authority import account_generation, require_active_account
 from omnigent.db.db_models import SqlSessionPermission, SqlUser, current_workspace_id
 from omnigent.db.utils import (
     get_or_create_engine,
@@ -150,7 +150,7 @@ class SqlAlchemyPermissionStore(PermissionStore):
             immediate=True,
         )
         # resolve_access cache (see _RESOLVE_ACCESS_CACHE_TTL_ENV). An LRU keyed
-        # (conversation_id, user_id) -> (expiry, access). conversation ids are
+        # (conversation_id, user_id, account_generation) -> (expiry, access). IDs are
         # globally unique, so grant/revoke can drop a whole session's entries —
         # including the shared __public__ grant, which affects every user of
         # that session — without depending on the ambient workspace context.
@@ -161,7 +161,7 @@ class SqlAlchemyPermissionStore(PermissionStore):
         self._resolve_cache_ttl_s = _resolve_access_cache_ttl_s()
         self._resolve_cache_max_entries = _resolve_access_cache_max_entries()
         self._resolve_cache: collections.OrderedDict[
-            tuple[str, str], tuple[float, ResolvedAccess]
+            tuple[str, str, str | None], tuple[float, ResolvedAccess]
         ] = collections.OrderedDict()
         self._resolve_cache_lock = threading.Lock()
         self._resolve_cache_clock: Callable[[], float] = time.monotonic
@@ -539,7 +539,7 @@ class SqlAlchemyPermissionStore(PermissionStore):
     def _resolve_cache_lookup(self, conversation_id: str, user_id: str) -> ResolvedAccess | None:
         """Return a live cached resolve_access result, or ``None`` on miss/expiry."""
         now = self._resolve_cache_clock()
-        key = (conversation_id, user_id)
+        key = (conversation_id, user_id, account_generation(user_id))
         with self._resolve_cache_lock:
             entry = self._resolve_cache.get(key)
             if entry is None:
@@ -570,7 +570,7 @@ class SqlAlchemyPermissionStore(PermissionStore):
         be stored on top of the eviction it already performed. Enforces the LRU
         entry cap so the cache cannot grow without bound on a long-lived replica.
         """
-        key = (conversation_id, user_id)
+        key = (conversation_id, user_id, account_generation(user_id))
         expiry = self._resolve_cache_clock() + self._resolve_cache_ttl_s
         with self._resolve_cache_lock:
             if generation != self._resolve_cache_generation:
