@@ -22,7 +22,8 @@ byte-identical to the uncached request. An unrecognized mode raises instead of
 silently disabling caching. Observations never carry prompt text, cache keys,
 or digests, so they are safe to log and export as telemetry.
 
-The names in ``__all__`` are the supported surface; everything else is private.
+``__all__`` is the consumer API. Planning, payload, hashing and endpoint helpers
+serve omnigent's own adapters and are not a stable interface.
 """
 
 from __future__ import annotations
@@ -42,24 +43,13 @@ if TYPE_CHECKING:
     from omnigent.llms.types import Usage
 
 __all__ = [
-    "NATIVE_HARNESS_CAPABILITY",
-    "PROMPT_CACHE_ENV_VAR",
     "PromptCacheCapability",
     "PromptCacheMechanism",
     "PromptCacheMode",
     "PromptCacheObservation",
     "PromptCacheOutcome",
-    "PromptCachePlan",
     "PromptCacheReason",
-    "apply_anthropic_cache_control",
-    "is_cache_hint_rejection",
-    "is_official_openai_base_url",
-    "observe_harness_usage",
-    "observe_response_usage",
-    "openai_prompt_cache_key",
-    "plan_prompt_cache",
     "resolve_prompt_cache_mode",
-    "stable_prefix_digest",
 ]
 
 PROMPT_CACHE_ENV_VAR = "OMNIGENT_PROMPT_CACHE"
@@ -70,7 +60,9 @@ _ANTHROPIC_CACHE_CONTROL: dict[str, str] = {"type": "ephemeral"}
 _OPENAI_API_HOST = "api.openai.com"
 _OPENAI_CACHE_KEY_PREFIX = "omnigent-"
 _VALIDATION_STATUS_CODES = frozenset({400, 422})
-_CACHE_HINT_FIELDS = ("cache_control", "prompt_cache_key")
+# Cache-only top-level request fields in the pinned OpenAI SDK (Responses and Chat).
+OPENAI_CACHE_HINT_FIELDS = ("prompt_cache_key", "prompt_cache_retention")
+_CACHE_HINT_FIELDS = ("cache_control", *OPENAI_CACHE_HINT_FIELDS)
 # Leaves the key well under OpenAI's prompt_cache_key length limit.
 _OPENAI_CACHE_KEY_HEX_CHARS = 32
 
@@ -382,6 +374,18 @@ def apply_anthropic_cache_control(payload: Mapping[str, Any]) -> dict[str, Any]:
     return cached
 
 
+def strip_openai_cache_hints(payload: dict[str, Any]) -> dict[str, Any]:
+    """
+    Drop OpenAI cache-only fields from a request payload.
+
+    :param payload: A Responses or Chat Completions payload.
+    :returns: ``payload`` itself when it has no such field, else a copy without them.
+    """
+    if not any(field in payload for field in OPENAI_CACHE_HINT_FIELDS):
+        return payload
+    return {key: value for key, value in payload.items() if key not in OPENAI_CACHE_HINT_FIELDS}
+
+
 def is_cache_hint_rejection(status_code: int, body: str) -> bool:
     """
     Whether a provider error is a refusal of the cache hints themselves.
@@ -440,11 +444,9 @@ def observe_response_usage(plan: PromptCachePlan, usage: Usage | None) -> Prompt
             controllable=capability.controllable,
             reason=PromptCacheReason.NO_USAGE,
         )
+    # Omitted counters stay None (UNKNOWN); only an explicit zero is a miss.
     read = _token_count(usage.cache_read_input_tokens)
     write = _token_count(usage.cache_creation_input_tokens)
-    if read is None and write is None:
-        # Usage without cache counters means nothing was read from cache.
-        read = 0
     # OpenAI keeps caching common prefixes automatically even when a routing
     # hint is absent or rejected; explicit breakpoints only cache when sent.
     caching_active = plan.apply or capability.mechanism is PromptCacheMechanism.AUTOMATIC_PREFIX
@@ -488,13 +490,6 @@ def observe_harness_usage(
             "cache_creation_input_tokens", usage.get("cumulative_cache_creation_input_tokens")
         )
     )
-    # Vendors omit cache counters when nothing was cached.
-    if (
-        read is None
-        and write is None
-        and any(key in usage for key in ("input_tokens", "cumulative_input_tokens"))
-    ):
-        read = 0
     return PromptCacheObservation(
         mechanism=capability.mechanism,
         outcome=_outcome(read, write, caching_active=True),

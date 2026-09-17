@@ -22,6 +22,7 @@ from omnigent.llms.prompt_cache import (
     is_cache_hint_rejection,
     is_official_openai_base_url,
     openai_prompt_cache_key,
+    strip_openai_cache_hints,
 )
 from omnigent.llms.types import (
     NATIVE_TOOL_OUTPUT_TYPES,
@@ -153,6 +154,9 @@ class OpenAICompatibleAdapter(BaseAdapter):
             params.get("base_url"),
             self._base_url,
         )
+        if not is_official_openai_base_url(effective_base):
+            # Only OpenAI's own API accepts its cache-only fields.
+            payload = strip_openai_cache_hints(payload)
         url = f"{effective_base}/chat/completions"
         headers = self._build_headers(
             api_key_override=params.get("api_key"),
@@ -541,8 +545,10 @@ class OpenAIAdapter(OpenAICompatibleAdapter):
         :param prompt_cache: Cache plan from the client. When it applies and
             the effective URL is OpenAI's own API, a ``prompt_cache_key``
             derived from the stable prefix (tools and instructions) is added.
-            Any key sent while caching is enabled, generated or caller-supplied,
-            is dropped and the request retried once if the provider refuses it.
+            On that endpoint, any cache hint sent while caching is enabled
+            (generated or caller-supplied) is dropped and the request retried
+            once if the provider refuses it. Other endpoints never receive
+            OpenAI cache-only fields.
         :param kwargs: Additional API kwargs (temperature, etc.).
         :returns: A :class:`Response` or an async iterator of
             :class:`ResponseStreamEvent`.
@@ -576,18 +582,20 @@ class OpenAIAdapter(OpenAICompatibleAdapter):
 
         cached_payload: dict[str, Any] | None = None
         cache_plan = prompt_cache if prompt_cache is not None and prompt_cache.enabled else None
-        if cache_plan is not None:
-            if "prompt_cache_key" in payload:
-                # A caller-supplied key wins, but still fails open if refused.
-                cached_payload = payload
-                payload = {k: v for k, v in payload.items() if k != "prompt_cache_key"}
-            elif cache_plan.apply and is_official_openai_base_url(effective_base):
-                cached_payload = {
-                    **payload,
-                    "prompt_cache_key": openai_prompt_cache_key(
-                        instructions, payload.get("tools")
-                    ),
-                }
+        if not is_official_openai_base_url(effective_base):
+            # Only OpenAI's own API accepts its cache-only fields.
+            payload = strip_openai_cache_hints(payload)
+        elif cache_plan is not None:
+            hinted = dict(payload)
+            # A caller-supplied key wins over the generated one.
+            if cache_plan.apply and "prompt_cache_key" not in hinted:
+                hinted["prompt_cache_key"] = openai_prompt_cache_key(
+                    instructions, payload.get("tools")
+                )
+            plain = strip_openai_cache_hints(payload)
+            if len(plain) != len(hinted):
+                # Every cache hint sent fails open to the plain payload.
+                cached_payload, payload = hinted, plain
 
         if stream:
             effective_to = timeout if timeout is not None else _STREAM_TIMEOUT
